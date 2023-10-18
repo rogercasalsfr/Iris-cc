@@ -1,0 +1,464 @@
+---
+title: "ATACseq prova"
+date: "2023-10-16"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+#Prepare the data
+
+##Libraries
+
+```{r}
+
+setwd("~/Github/Prova ATAC")
+library(Signac)
+library(Seurat)
+library(EnsDb.Hsapiens.v75)
+library(ggplot2)
+library(patchwork)
+library(hdf5r)
+
+
+```
+
+
+
+##Get the data
+We read the files
+
+When pre-processing chromatin data, Signac uses information from two related input files, both of which can be created using CellRanger:
+  
+Peak/Cell matrix. This is analogous to the gene expression count matrix used to analyze single-cell RNA-seq. However, instead of genes, each row of the matrix represents a region of the genome (a peak), that is predicted to represent a region of open chromatin.  Each value in the matrix represents the number of Tn5 integration sites for each single barcode (i.e. a cell) that map within each peak. You can find more detail on the 10X Website.
+
+Fragment file. This represents a full list of all unique fragments across all single cells. It is a substantially larger file, is slower to work with, and is stored on-disk(instead of in memory). However, the advantage of retaining this file is that it contains all fragments associated with each single cell, as opposed to only fragments that map to peaks. More information about the fragment file can be found on the 10x Genomics website or on the sinto website.
+
+```{r}
+counts <- Read10X_h5(filename = "atac_v1_pbmc_10k_filtered_peak_bc_matrix.h5")
+metadata <- read.csv(
+  file = "atac_v1_pbmc_10k_singlecell.csv",
+  header = TRUE,
+  row.names = 1
+)
+
+
+chrom_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  fragments = 'atac_v1_pbmc_10k_fragments.tsv.gz',
+  min.cells = 10,
+  min.features = 200
+)
+
+
+
+```
+
+
+You can specify the genome if its the case
+Human: hg38
+Mouse: ...
+
+The separator you know with the counts file, chrY:590234-590289. Those are the ranges and the chromosomes
+
+
+
+```{r}
+
+pbmc <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "peaks",
+  meta.data = metadata
+)
+
+```
+
+
+Object called ChromatinAssay, includes motif inforation, gene annotations and genome information.
+
+##Annotation
+
+We also add annotations from the human genome with EnsDB package, and relate it with the ranges that we have on chromatin accessible data.
+
+```{r}
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v75)
+
+```
+
+change to UCSC style since the data was mapped to hg19
+
+```{r}
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "hg19"
+```
+
+Add the information to the object
+
+```{r}
+Annotation(pbmc) <- annotations
+
+```
+
+
+We have to annotate the genes before preprocess the data, because now we know where the genes are. Especially we are interested in the gene promoter.
+
+
+#Preprocessing steps
+
+AFEGIR DEFINICIONS DE TSS, FRAGMENTS IN PEAKS ETC.... BLACKLIST ET..... VEURE COM HO PODEM ENCABIR...
+
+##Nucleosome Signal
+
+Calculate the nucleosome signal score per cell 
+```{r}
+pbmc <- NucleosomeSignal(object = pbmc)
+
+```
+
+It calculates a fragment ratio 147:294 bp
+<147 Average length to wrap around one histon is 
+Nucleosomes (histones) and nucleosomes free
+
+
+##TSS.enrichment
+
+We compute the TSS enrichment score per cell. Transcription start site (TSS), based on the gene location
+```{r}
+pbmc <- TSSEnrichment(object = pbmc, fast = FALSE)
+pbmc[[]]
+```
+
+We take a look at the metadata
+
+
+
+##Blacklist region ratio
+
+This blacklist region are junk regions that have been annotated, and they have some sort of high signal in different NGS (Next Generation Sequencing) experiments, independent of cell type experiments
+
+```{r}
+
+pbmc$pct_reads_in_peaks <- pbmc$peak_region_fragments / pbmc$passed_filters * 100
+pbmc$blacklist_ratio <- pbmc$blacklist_region_fragments / pbmc$peak_region_fragments
+
+```
+
+
+
+##Scatter plot 
+```{r}
+DensityScatter(pbmc, x = 'nCount_peaks', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE)
+```
+We can inspect the TSS enrichment scores by grouping the cells based on the score and plotting the accessibility signal over all TSS sites. Setting the fast=TRUE option in TSSEnrichment() will only compute the TSS enrichment score without storing the entire cell by position matrix of Tn5 insertion frequency for each cell, and can save memory. However, setting fast=TRUE will not allow downstream plotting of the TSS enrichment signal for different groups of cells using the TSSPlot() function, shown here:
+
+
+EXPLICAR QUÈ VOL DIR AQUEST GRÀFIC (NO L'ACABO D'ENTENDRE LA VERITAT.....)
+
+##Violin Plot
+
+
+```{r}
+VlnPlot(
+  object=pbmc,
+  features=c("peak_region_fragments", "pct_reads_in_peaks",
+             "blacklist_ratio", "nucleosome_signal", "TSS.enrichment"),
+  pt.size=0.1,
+  ncol=5
+)
+```
+
+VEURE QUIN OUTPUT SURT, I PERQUÈ, TAMBÉ L'HAURIEM D'ENTENDRE. 
+
+After those steps, we preprocess the data. 
+
+##Preprocessing
+
+```{r}
+#We can also pick our thresholds in 2% low and high...
+low_prf <- quantile(pbmc[["peak_region_fragments"]]$peak_region_fragments, probs=0.02)
+high_prf <- quantile(pbmc[["peak_region_fragments"]]$peak_region_fragments, probs=0.98)
+
+low_prp <- quantile(pbmc[["pct_reads_in_peaks"]]$pct_reads_in_peaks, probs=0.02)
+high_blr <- quantile(pbmc[["blacklist_ratio"]]$blacklist_ratio, probs=0.98)
+
+low_ts <- quantile(pbmc[["TSS.enrichment"]]$TSS.enrichment, probs=0.02)
+high_ns <- quantile(pbmc[["nucleosome_signal"]]$nucleosome_signal, probs=0.98)
+
+
+pbmc <- subset(
+  x = pbmc,
+  subset = nCount_peaks > low_prf &
+    nCount_peaks < high_prf &
+    pct_reads_in_peaks > low_prp &
+    blacklist_ratio < high_blr &
+    nucleosome_signal < high_ns &
+    TSS.enrichment > low_ts
+)
+```
+
+
+#Data analysis
+
+
+##Normalization, feature selection, dimension reduction
+```{r}
+pbmc <- RunTFIDF(pbmc)
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q0')
+pbmc <- RunSVD(pbmc)
+
+```
+
+
+Normalization: Signac performs term frequency-inverse document frequency (TF-IDF) normalization. This is a two-step normalization procedure, that both normalizes across cells to correct for differences in cellular sequencing depth, and across peaks to give higher values to more rare peaks.
+
+Feature selection: The low dynamic range of scATAC-seq data makes it challenging to perform variable feature selection, as we do for scRNA-seq. Instead, we can choose to use only the top n% of features (peaks) for dimensional reduction, or remove features present in less than n cells with the FindTopFeatures() function. Here we will use all features, though we have seen very similar results when using only a subset of features (try setting min.cutoff to ‘q75’ to use the top 25% all peaks), with faster runtimes. Features used for dimensional reduction are automatically set as VariableFeatures() for the Seurat object by this function.
+
+Dimension reduction: We next run singular value decomposition (SVD) on the TD-IDF matrix, using the features (peaks) selected above. This returns a reduced dimension representation of the object (for users who are more familiar with scRNA-seq, you can think of this as analogous to the output of PCA).
+
+
+We identify how the components are correlated
+```{r}
+DepthCor(pbmc)
+
+```
+
+We have to get rid of this first component because it is highly correlated
+
+
+We use 2:30 dimensions because we don't want to use the first dimension
+```{r}
+pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 2:30)
+pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 2:30)
+```
+
+We have to play with the CLUSTER RESOLUTION .....
+
+```{r}
+pbmc <- FindClusters(object = pbmc, verbose = FALSE, algorithm = 3, resolution = .5)
+DimPlot(object = pbmc, label = TRUE) + NoLegend()
+
+```
+
+
+##Gene activities
+Measures gene activity based on the chromatin accessibility near that gene. The estimation RNA expression based on ATAC data
+
+```{r}
+gene.activities <- GeneActivity(pbmc)
+
+```
+
+HOW DOES IT WORK THIS FUNCTION???????
+
+
+After that we add the gene activity matrix to the Seurat object as a new assay and we normalize it.
+
+
+```{r}
+pbmc[['RNA']] <- CreateAssayObject(counts = gene.activities)
+
+#We normalize the data
+pbmc <- NormalizeData(
+  object = pbmc,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(pbmc$nCount_RNA)
+)
+
+
+#We set default to RNA in order to plot for example
+DefaultAssay(pbmc) <- 'RNA'
+
+FeaturePlot(
+  object = pbmc,
+  features = c('MS4A1', 'CD3D', 'LEF1', 'NKG7', 'TREM1', 'LYZ'),
+  pt.size = 0.1,
+  max.cutoff = 'q95',
+  ncol = 3
+)
+```
+
+
+#Load pre-processed scRNA-seq data
+
+```{r}
+# Load the pre-processed scRNA-seq data for PBMCs
+pbmc_rna <- readRDS("pbmc_10k_v3.rds")
+pbmc_rna = UpdateSeuratObject(object = pbmc_rna)
+
+```
+
+
+
+##Transfer anchors
+
+```{r}
+transfer.anchors <- FindTransferAnchors(
+  reference = pbmc_rna,
+  query = pbmc,
+  reduction = 'cca'
+)
+
+```
+
+
+##Predicted labels
+
+```{r}
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = pbmc_rna$celltype,
+  weight.reduction = pbmc[['lsi']],
+  dims = 2:30
+)
+pbmc <- AddMetaData(object = pbmc, metadata = predicted.labels)
+
+```
+
+QUÈ VOLEN DIR AQUESTES FUNCIONS???? LA VERITAT ÉS QUE NO HO SÉ..... buscar i com ho podem interpretar. 
+
+
+
+##Comparative plot
+
+```{r}
+
+plot1 <- DimPlot(
+  object = pbmc_rna,
+  group.by = 'celltype',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scRNA-seq')
+
+plot2 <- DimPlot(
+  object = pbmc,
+  group.by = 'predicted.id',
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scATAC-seq')
+
+plot1 + plot2
+```
+
+
+##Replace labels
+```{r}
+for(i in levels(pbmc)) {
+  cells_to_reid <- WhichCells(pbmc, idents = i)
+  newid <- names(which.max(table(pbmc$predicted.id[cells_to_reid])))
+  Idents(pbmc, cells = cells_to_reid) <- newid
+}
+```
+
+
+
+#ATAC analysis
+
+To find differentially accessible regions between clusters of cells, we can perform a differential accessibility (DA) test. We utilize logistic regression for DA, as suggested by Ntranos et al. 2018 for scRNA-seq data, and add the total number of fragments as a latent variable to mitigate the effect of differential sequencing depth on the result. Here we will focus on comparing Naive CD4 cells and CD14 monocytes, but any groups of cells can be compared using these methods. We can also visualize these marker peaks on a violin plot, feature plot, dot plot, heat map, or any visualization tool in Seurat.
+
+We get back to the peaks instead of gene activites
+
+```{r}
+
+DefaultAssay(pbmc) <- 'peaks'
+
+da_peaks <- FindMarkers(
+  object = pbmc,
+  ident.1 = "CD4 Naive",
+  ident.2 = "CD14+ Monocytes",
+  test.use = 'LR',
+  latent.vars = 'nCount_peaks'
+)
+#Latent vars, could be changed into another variable
+
+head(da_peaks)
+
+
+
+```
+
+
+##PLOT
+
+```{r}
+plot1 <- VlnPlot(
+  object = pbmc,
+  features = rownames(da_peaks)[1],
+  pt.size = 0.1,
+  idents = c("CD4 Naive","CD14+ Monocytes")
+)
+
+#We show the accessibility with a featureplot
+#SERIA COM UNA MENA D'EXPRESSION? 
+plot2 <- FeaturePlot(
+  object = pbmc,
+  features = rownames(da_peaks)[1],
+  pt.size = 0.1
+)
+
+#What's this plot, what do we obtain?
+plot1 | plot2
+```
+
+
+
+
+
+```{r}
+#We calculate the log fold change
+fc <- FoldChange(pbmc, ident.1 = "CD4 Naive", ident.2 = "CD14+ Monocytes")
+# order by fold change
+fc <- fc[order(fc$avg_log2FC, decreasing = TRUE), ]
+head(fc)
+
+
+
+```
+
+```{r}
+
+open_cd4naive <- rownames(da_peaks[da_peaks$avg_log2FC > 3, ])
+open_cd14mono <- rownames(da_peaks[da_peaks$avg_log2FC < -3, ])
+
+
+#We have to find the closest gene to the regions
+closest_genes_cd4naive <- ClosestFeature(pbmc, regions = open_cd4naive)
+closest_genes_cd14mono <- ClosestFeature(pbmc, regions = open_cd14mono)
+
+ 
+
+# We have also the distance
+head(closest_genes_cd4naive)
+```
+
+
+```{r}
+# set plotting order
+levels(pbmc) <- c("CD4 Naive","CD4 Memory","CD8 Naive","CD8 effector","Double negative T cell","NK dim","pre-B cell",'B cell progenitor',"pDC","Dendritic cell","CD14+ Monocytes",'CD16+ Monocytes')
+
+
+```
+
+WHY??????
+
+##Coverage Plot
+
+```{r}
+#We determine the CoveragePlot, of the "GENE", we choose which gene, and we have to find
+#the differences between "da_peaks" subtypes, conditions....
+
+#Because, we can determine if the gene is transcribing.....
+CoveragePlot(
+  object = pbmc,
+  region = rownames(da_peaks)[1],
+  extend.upstream = 20000,
+  extend.downstream = 10000
+)
+
+```
+
+
+
